@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: synthetics
+  labels:
+    app: synthetics
+    environment: production

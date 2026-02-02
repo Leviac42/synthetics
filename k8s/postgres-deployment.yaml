@@ -1,0 +1,214 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+  namespace: synthetics
+  labels:
+    app: synthetics
+    component: database
+data:
+  init.sql: |
+    -- Synthetic Monitoring Database Schema
+    CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+    
+    CREATE TABLE IF NOT EXISTS monitors (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        url TEXT NOT NULL,
+        schedule_cron VARCHAR(100) NOT NULL DEFAULT '*/5 * * * *',
+        enabled BOOLEAN NOT NULL DEFAULT true,
+        timeout_seconds INTEGER NOT NULL DEFAULT 30,
+        tags JSONB DEFAULT '{}',
+        created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        CONSTRAINT monitors_name_check CHECK (char_length(name) > 0),
+        CONSTRAINT monitors_timeout_check CHECK (timeout_seconds >= 5 AND timeout_seconds <= 300)
+    );
+    
+    CREATE INDEX IF NOT EXISTS idx_monitors_enabled ON monitors(enabled) WHERE enabled = true;
+    CREATE INDEX IF NOT EXISTS idx_monitors_created_at ON monitors(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_monitors_tags ON monitors USING GIN(tags);
+    
+    CREATE TABLE IF NOT EXISTS execution_logs (
+        id BIGSERIAL PRIMARY KEY,
+        monitor_id INTEGER NOT NULL REFERENCES monitors(id) ON DELETE CASCADE,
+        started_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        completed_at TIMESTAMP WITH TIME ZONE,
+        status VARCHAR(50) NOT NULL DEFAULT 'running',
+        error_message TEXT,
+        har_data JSONB,
+        CONSTRAINT execution_logs_status_check CHECK (status IN ('running', 'success', 'error', 'timeout'))
+    );
+    
+    CREATE INDEX IF NOT EXISTS idx_execution_logs_monitor_id ON execution_logs(monitor_id);
+    CREATE INDEX IF NOT EXISTS idx_execution_logs_started_at ON execution_logs(started_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_execution_logs_monitor_started ON execution_logs(monitor_id, started_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_execution_logs_status ON execution_logs(status);
+    CREATE INDEX IF NOT EXISTS idx_execution_logs_completed_at ON execution_logs(completed_at DESC) WHERE completed_at IS NOT NULL;
+    
+    CREATE TABLE IF NOT EXISTS performance_metrics (
+        id BIGSERIAL PRIMARY KEY,
+        execution_log_id BIGINT NOT NULL REFERENCES execution_logs(id) ON DELETE CASCADE,
+        metric_name VARCHAR(100) NOT NULL,
+        metric_value DOUBLE PRECISION NOT NULL,
+        recorded_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        CONSTRAINT performance_metrics_metric_name_check CHECK (char_length(metric_name) > 0)
+    );
+    
+    CREATE INDEX IF NOT EXISTS idx_performance_metrics_execution_log_id ON performance_metrics(execution_log_id);
+    CREATE INDEX IF NOT EXISTS idx_performance_metrics_recorded_at ON performance_metrics(recorded_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_performance_metrics_metric_name ON performance_metrics(metric_name);
+    CREATE INDEX IF NOT EXISTS idx_performance_metrics_metric_recorded ON performance_metrics(metric_name, recorded_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_performance_metrics_composite ON performance_metrics(metric_name, recorded_at DESC, metric_value);
+    
+    CREATE OR REPLACE VIEW latest_monitor_metrics AS
+    SELECT 
+        m.id as monitor_id,
+        m.name as monitor_name,
+        m.url as monitor_url,
+        m.enabled as monitor_enabled,
+        el.id as execution_log_id,
+        el.started_at,
+        el.completed_at,
+        el.status,
+        el.error_message,
+        MAX(CASE WHEN pm.metric_name = 'ttfb_ms' THEN pm.metric_value END) as ttfb_ms,
+        MAX(CASE WHEN pm.metric_name = 'dom_content_loaded_ms' THEN pm.metric_value END) as dom_content_loaded_ms,
+        MAX(CASE WHEN pm.metric_name = 'page_load_time_ms' THEN pm.metric_value END) as page_load_time_ms
+    FROM monitors m
+    LEFT JOIN LATERAL (
+        SELECT * FROM execution_logs 
+        WHERE monitor_id = m.id 
+        ORDER BY started_at DESC 
+        LIMIT 1
+    ) el ON true
+    LEFT JOIN performance_metrics pm ON el.id = pm.execution_log_id
+    GROUP BY m.id, m.name, m.url, m.enabled, el.id, el.started_at, el.completed_at, el.status, el.error_message;
+    
+    CREATE OR REPLACE FUNCTION update_updated_at_column()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        NEW.updated_at = NOW();
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+    
+    DROP TRIGGER IF EXISTS update_monitors_updated_at ON monitors;
+    CREATE TRIGGER update_monitors_updated_at
+        BEFORE UPDATE ON monitors
+        FOR EACH ROW
+        EXECUTE FUNCTION update_updated_at_column();
+    
+    INSERT INTO monitors (name, url, schedule_cron, enabled, timeout_seconds, tags)
+    VALUES 
+        ('Example Monitor', 'https://example.com', '*/5 * * * *', true, 30, '{"environment": "production", "team": "platform"}')
+    ON CONFLICT DO NOTHING;
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-secret
+  namespace: synthetics
+  labels:
+    app: synthetics
+    component: database
+type: Opaque
+stringData:
+  # Zero-config defaults - CHANGE THESE IN PRODUCTION!
+  postgres-password: synthetics123
+  postgres-user: synthetics
+  postgres-db: synthetics
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: synthetics
+  labels:
+    app: synthetics
+    component: database
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: synthetics
+      component: database
+  template:
+    metadata:
+      labels:
+        app: synthetics
+        component: database
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: POSTGRES_DB
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: postgres-db
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: postgres-user
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: postgres-password
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        ports:
+        - containerPort: 5432
+          name: postgres
+          protocol: TCP
+        volumeMounts:
+        - name: postgres-storage
+          mountPath: /var/lib/postgresql/data
+        - name: postgres-init
+          mountPath: /docker-entrypoint-initdb.d
+          readOnly: true
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - pg_isready -U $POSTGRES_USER -d $POSTGRES_DB
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - pg_isready -U $POSTGRES_USER -d $POSTGRES_DB
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+      volumes:
+      - name: postgres-storage
+        persistentVolumeClaim:
+          claimName: postgres-pvc
+      - name: postgres-init
+        configMap:
+          name: postgres-init
+      # Security context for OpenShift compatibility
+      securityContext:
+        fsGroup: 999
+        runAsNonRoot: true
+        runAsUser: 999

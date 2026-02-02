@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+  namespace: synthetics
+  labels:
+    app: synthetics
+    component: database
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  # No storageClassName specified - uses cluster default
+  # This ensures compatibility with:
+  # - MicroK8s (hostpath-storage)
+  # - OpenShift (standard dynamic provisioner)
+  # - K3s (local-path)

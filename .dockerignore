@@ -1,0 +1,16 @@
+# .dockerignore
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.log
+.git/
+.gitignore
+README.md
+.vscode/
+.idea/
+*.har
